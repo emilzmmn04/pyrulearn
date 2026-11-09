@@ -309,7 +309,9 @@ class DeepRuleLearner(NativeRuleLearner):
     `max_seconds` (local search, the genetic algorithm, `DeepNeuroFuzzy`;
     `DeepSAT` has its own) ends the search when the time since the start of
     the fit is up, with the best network so far -- for runs with many
-    epochs or generations, judged by time.
+    epochs or generations, judged by time. `restarts` (the same learners
+    and `DeepBlameRevision`) runs the search again from a new start, the
+    best network of all runs the result; ``-1`` until `max_seconds`.
 
     The learners are anytime algorithms: with `trace`, the model's `trace`
     lists every new best network on the training set during the fit
@@ -432,7 +434,54 @@ class DeepRuleLearner(NativeRuleLearner):
         raise NotImplementedError
 
 
-class DeepLocalSearch(DeepRuleLearner):
+class _Restarts:
+    """Restarts for the stochastic learners (a mixin before
+    `DeepRuleLearner`): a run of their search ends in a local optimum,
+    and runs differ, so `restarts` more runs (default 0: one), ``-1`` as
+    many as fit into `max_seconds` (which it needs); `max_seconds` ends
+    them in any case. Every run after the first starts from a new
+    `_initialize` -- a new random network with `RandomInit`, the same
+    rules with `RuleSetInit` (the run's own randomness differs). The
+    result is the best network of all runs by the objective (the training
+    error plus `size_penalty` per backbone edge; then size), and the
+    trace shows each new best across the runs. A learner implements one
+    run as `_fit_once` (what `_fit_weights` is for the others)."""
+
+    def _set_restarts(self, restarts: int) -> None:
+        if restarts < -1:
+            raise ValueError(f"restarts must be at least 0, or -1 (until max_seconds), got {restarts!r}")
+        if restarts == -1 and getattr(self, "max_seconds", None) is None:
+            raise ValueError("restarts=-1 restarts until max_seconds is up, so it needs max_seconds")
+        self.restarts = restarts
+
+    def _provenance_params(self):
+        params = super()._provenance_params()
+        if params.get("restarts") == 0:  # the default changes nothing: results cached before it stay valid
+            params.pop("restarts")
+        return params
+
+    def _fit_weights(self, data, labels, X, targets, shapes, start, sample_weight, rng):
+        if self.restarts == 0:
+            return self._fit_once(data, labels, X, targets, shapes, start, sample_weight, rng)
+        best, best_key, runs = None, None, 0
+        while True:
+            if runs:
+                start = [np.asarray(w, dtype=bool) for w in self._initialize(data, labels, shapes, rng)]
+            weights = self._fit_once(data, labels, X, targets, shapes, start, sample_weight, rng)
+            runs += 1
+            error = self._error(weights, X, targets, sample_weight)
+            key = (self._cost(error, weights), self._size(weights))
+            if best is None or key < best_key:
+                best, best_key = weights, key
+            if (self.restarts != -1 and runs > self.restarts) or self._time_up() or (
+                    self.size_penalty is None and best_key[0] == 0):
+                return best
+
+    def _fit_once(self, data, labels, X, targets, shapes, start, sample_weight, rng):
+        raise NotImplementedError
+
+
+class DeepLocalSearch(_Restarts, DeepRuleLearner):
     """Stochastic hill climbing over the edges of a `DeepModel`, after Beck
     & Fürnkranz (2021, their code: github.com/f-beck/scikit-learn-rule-
     network). On a mini-batch of `batch_size` training rows, every single
@@ -482,6 +531,7 @@ class DeepLocalSearch(DeepRuleLearner):
         first: str = "and",
         target_class: Optional[Any] = None,
         max_seconds: Optional[float] = None,
+        restarts: int = 0,
         size_penalty: Optional[float] = None,
         trace: bool = False,
         random_state: Optional[int] = 0,
@@ -489,6 +539,7 @@ class DeepLocalSearch(DeepRuleLearner):
         super().__init__(layers=layers, first=first, init=init, trace=trace, random_state=random_state,
                          target_class=target_class, size_penalty=size_penalty)
         self.max_seconds = max_seconds
+        self._set_restarts(restarts)
         if moves not in self.MOVES:
             raise ValueError(f"moves must be one of {self.MOVES}, got {moves!r}")
         if (n_epochs is not None and n_epochs < 0) or (max_flips is not None and max_flips < 0):
@@ -503,7 +554,7 @@ class DeepLocalSearch(DeepRuleLearner):
 
     # -- the fit ----------------------------------------------------------
 
-    def _fit_weights(self, data, labels, X, targets, shapes, start, sample_weight, rng):
+    def _fit_once(self, data, labels, X, targets, shapes, start, sample_weight, rng):
         conflicts = self._conflicts(data.spec)
         weights = start
         n = X.shape[0]
@@ -710,7 +761,7 @@ class DeepLocalSearch(DeepRuleLearner):
             error = best
 
 
-class DeepGenetic(DeepRuleLearner):
+class DeepGenetic(_Restarts, DeepRuleLearner):
     """A memetic algorithm over the weights of a `DeepModel`: a genetic
     algorithm whose children are improved by a few hill-climbing steps.
 
@@ -767,6 +818,7 @@ class DeepGenetic(DeepRuleLearner):
         first: str = "and",
         target_class: Optional[Any] = None,
         max_seconds: Optional[float] = None,
+        restarts: int = 0,
         size_penalty: Optional[float] = None,
         trace: bool = False,
         random_state: Optional[int] = 0,
@@ -774,6 +826,7 @@ class DeepGenetic(DeepRuleLearner):
         super().__init__(layers=layers, first=first, init=init, trace=trace, random_state=random_state,
                          target_class=target_class, size_penalty=size_penalty)
         self.max_seconds = max_seconds
+        self._set_restarts(restarts)
         if population < 2 or not 0 <= elite < population or tournament < 1:
             raise ValueError("population must be at least 2, elite below it, tournament at least 1")
         if generations < 0 or local_flips < 0 or mutations < 0 or batch_size < 1:
@@ -796,7 +849,7 @@ class DeepGenetic(DeepRuleLearner):
         self.polish = polish
         self.seeds = list(seeds)
 
-    def _fit_weights(self, data, labels, X, targets, shapes, start, sample_weight, rng):
+    def _fit_once(self, data, labels, X, targets, shapes, start, sample_weight, rng):
         climber = DeepLocalSearch(moves=self.moves, max_flips=self.local_flips, first=self.first,
                                   size_penalty=self.size_penalty, max_seconds=self.max_seconds)
         climber._tracker = self._tracker
@@ -1344,7 +1397,7 @@ class DeepSAT(DeepRuleLearner):
         return out
 
 
-class DeepNeuroFuzzy(DeepRuleLearner):
+class DeepNeuroFuzzy(_Restarts, DeepRuleLearner):
     """The weights of a `DeepModel` by gradient descent on a fuzzy
     relaxation, after Wang et al.'s multilayer logical perceptron with
     random binarization ("Transparent classification with multilayer
@@ -1406,6 +1459,7 @@ class DeepNeuroFuzzy(DeepRuleLearner):
         first: str = "and",
         target_class: Optional[Any] = None,
         max_seconds: Optional[float] = None,
+        restarts: int = 0,
         size_penalty: Optional[float] = None,
         trace: bool = False,
         random_state: Optional[int] = 0,
@@ -1413,6 +1467,7 @@ class DeepNeuroFuzzy(DeepRuleLearner):
         super().__init__(layers=layers, first=first, init=init, trace=trace, random_state=random_state,
                          target_class=target_class, size_penalty=size_penalty)
         self.max_seconds = max_seconds
+        self._set_restarts(restarts)
         self.init = init  # None: the paper's random start (the base class would put in RandomInit)
         if loss not in self.LOSSES:
             raise ValueError(f"loss must be one of {self.LOSSES}, got {loss!r}")
@@ -1434,7 +1489,7 @@ class DeepNeuroFuzzy(DeepRuleLearner):
             return [np.zeros(shape, dtype=bool) for shape in shapes]
         return self.init.weights(data, labels, shapes, rng, self.first)
 
-    def _fit_weights(self, data, labels, X, targets, shapes, start, sample_weight, rng):
+    def _fit_once(self, data, labels, X, targets, shapes, start, sample_weight, rng):
         W = [np.where(s, self.init_high, rng.uniform(0, self.init_scale, s.shape)) if self.init is not None
              else rng.uniform(0, self.init_scale, s.shape) for s in start]
         adam_m = [np.zeros_like(w) for w in W]
@@ -1522,7 +1577,7 @@ class DeepNeuroFuzzy(DeepRuleLearner):
         return grads
 
 
-class DeepBlameRevision(DeepRuleLearner):
+class DeepBlameRevision(_Restarts, DeepRuleLearner):
     """Blame revision on mini-batches: the network's errors on a batch are
     passed down from the outputs as targets for the nodes, layer by layer,
     and each node revises its own edges to meet them -- a symbolic
@@ -1569,11 +1624,8 @@ class DeepBlameRevision(DeepRuleLearner):
     empty network (`init` takes another), which recruitment builds up.
 
     A run ends in a local optimum within seconds, and runs differ (the
-    batches, the tie-breaking, the recruits' seeds): `restarts` more runs
-    from the same start (default 0: one run), ``-1`` as many as fit into
-    `max_seconds` (which it needs); `max_seconds` ends them in any case.
-    The best network of all runs by the objective (then size) is the
-    result, and the trace shows each new best across the runs. In
+    batches, the tie-breaking, the recruits' seeds): `restarts`, as for
+    the other stochastic learners (`_Restarts`). In
     a first AND layer, rules stay consistent with the `DataSpec`'s
     constraints (`contradictions`) unless ``moves="free"``."""
 
@@ -1603,12 +1655,7 @@ class DeepBlameRevision(DeepRuleLearner):
             raise ValueError(f"soft_weight must be in (0, 1], got {soft_weight!r}")
         if moves not in ("consistent", "free"):
             raise ValueError(f"moves must be 'consistent' or 'free', got {moves!r}")
-        if restarts < -1:
-            raise ValueError(f"restarts must be at least 0, or -1 (until max_seconds), got {restarts!r}")
-        if restarts == -1 and max_seconds is None:
-            raise ValueError("restarts=-1 restarts until max_seconds is up, so it needs max_seconds")
         self.init = init  # None: the empty network
-        self.restarts = restarts
         self.batch_size = batch_size
         self.max_steps = max_steps
         self.patience = patience
@@ -1616,6 +1663,7 @@ class DeepBlameRevision(DeepRuleLearner):
         self.soft_weight = soft_weight
         self.moves = moves
         self.max_seconds = max_seconds
+        self._set_restarts(restarts)
 
     def _initialize(self, data, labels, shapes, rng):
         if self.init is None:
@@ -1624,26 +1672,12 @@ class DeepBlameRevision(DeepRuleLearner):
 
     # -- the fit ----------------------------------------------------------------
 
-    def _fit_weights(self, data, labels, X, targets, shapes, start, sample_weight, rng):
+    def _fit_once(self, data, labels, X, targets, shapes, start, sample_weight, rng):
         conflicts = contradictions(data.spec) if self.moves == "consistent" and self.first == "and" else None
         n = X.shape[0]
         batch = n if self.batch_size is None else min(self.batch_size, n)
         # an edge against the batch's rows: lambda scaled from all the rows to the batch
         lam = (self.size_penalty if self.size_penalty else 1e-6) * batch / n
-        best, best_key, runs = None, None, 0
-        while True:
-            weights, key = self._run(start, X, targets, sample_weight, conflicts, lam, batch, rng)
-            runs += 1
-            if best is None or key < best_key:
-                best, best_key = weights, key
-            if self._time_up() or (self.restarts != -1 and runs > self.restarts) or (
-                    best_key[0] == 0 and self.size_penalty is None):
-                return best
-
-    def _run(self, start, X, targets, sample_weight, conflicts, lam, batch, rng):
-        """One run of blame revision from `start`: the network it ends with
-        and its (objective, size)."""
-        n = X.shape[0]
         weights = [w.copy() for w in start]
         error = self._error(weights, X, targets, sample_weight)
         key = (self._cost(error, weights), self._size(weights))
@@ -1663,7 +1697,7 @@ class DeepBlameRevision(DeepRuleLearner):
                 stale += 1
             if error == 0 and self.size_penalty is None:
                 break
-        return weights, key
+        return weights
 
     def _revise(self, weights, X, targets, row_weight, conflicts, lam, rng) -> List[np.ndarray]:
         """One step of blame revision on the batch (X, targets): the

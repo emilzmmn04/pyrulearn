@@ -18,9 +18,16 @@ is in early development (alpha): until 1.0, minor versions may change the API.
   the inputs that decide them (their Boolean derivative). Starts from the
   empty network by default. Learns parity-4 and the two-bit
   `parity_groups` exactly, where Pypper and the other deep learners do
-  not; still well behind Pypper on tic-tac-toe and KRK. `restarts`: more
-  runs from the same start (`-1`: until `max_seconds`), the best by the
-  objective kept -- a run ends in a local optimum within seconds.
+  not; still well behind Pypper on tic-tac-toe and KRK.
+- `restarts` on `DeepLocalSearch`, `DeepGenetic`, `DeepNeuroFuzzy` and
+  `DeepBlameRevision` (a mixin, `_Restarts`): more runs, each from a new
+  start of `init` (a new random network, or the same rules), `-1` until
+  `max_seconds`; the best network by the objective is kept, the trace
+  shows each new best across the runs. The default 0 is one run, as
+  before (the same weights; left out of the provenance, so cached results
+  stay valid). With 300 s, `[32, 8, 8]`: tic-tac-toe 0.87-0.92 -> 0.97-0.99
+  for blame revision, local search and the genetic algorithm; nothing
+  where one run takes the whole budget (KRK) or every run ends alike.
 
 ## 0.6.0 (2026-11-08)
 

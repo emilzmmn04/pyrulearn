@@ -569,22 +569,30 @@ def test_blame_revision_local_edit_covers_a_row_at_once():
     assert S.tolist() == [True, False, False]
 
 
-def test_blame_revision_restarts_keep_the_best_run():
+@pytest.mark.parametrize("learner, kw", [
+    (DeepBlameRevision, dict(layers=[16, 4, 4], batch_size=64)),
+    (DeepLocalSearch, dict(layers=[16, 4, 4], n_epochs=2)),
+    (DeepGenetic, dict(layers=[16, 4, 4], generations=2, population=4)),
+    (DeepNeuroFuzzy, dict(layers=[16, 4, 4], epochs=5)),
+])
+def test_restarts_keep_the_best_run(learner, kw):
     data = _boolean_data(lambda x1, x2, x3, x4, x5, x6, *_: (x1 ^ x2) & (x3 ^ x4) | (x5 & x6))
-    kw = dict(layers=[16, 4, 4], size_penalty=1.0, batch_size=64, target_class="yes", random_state=1)
+    kw = dict(kw, size_penalty=1.0, target_class="yes", random_state=1)
 
     def cost(model):
         return int((model.predict(data) != data.y).sum()) + model.pruned().n_edges
 
-    one = DeepBlameRevision(**kw).fit(data)
-    more = DeepBlameRevision(restarts=4, trace=True, **kw).fit(data)
+    one = learner(**kw).fit(data)
+    more = learner(restarts=3, trace=True, **kw).fit(data)
     assert cost(more) <= cost(one)  # the first run is the same, the others can only do better
     assert [p.seconds for p in more.trace] == sorted(p.seconds for p in more.trace)
-    timed = DeepBlameRevision(restarts=-1, max_seconds=1.0, **kw)
+    # restarts=0 is the learner as it was: the same weights, the same provenance
+    assert [w.tolist() for w in learner(restarts=0, **kw).fit(data).weights] == [w.tolist() for w in one.weights]
+    assert "restarts" not in learner(**kw)._provenance_params()
     t = time.perf_counter()
-    timed.fit(data)
-    assert time.perf_counter() - t < 3.0
+    learner(restarts=-1, max_seconds=1.0, **kw).fit(data)
+    assert time.perf_counter() - t < 4.0
     with pytest.raises(ValueError, match="needs max_seconds"):
-        DeepBlameRevision(restarts=-1)
+        learner(restarts=-1)
     with pytest.raises(ValueError):
-        DeepBlameRevision(restarts=-2)
+        learner(restarts=-2)
