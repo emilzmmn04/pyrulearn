@@ -3,6 +3,23 @@
 All notable changes to pyrulearn are listed here, newest first. The project
 is in early development (alpha): until 1.0, minor versions may change the API.
 
+## Unreleased
+
+### Added
+
+- `DeepBlameRevision` (experimental, branch `experimental/blame-revision`):
+  a fifth `DeepModel` learner, a symbolic counterpart of backpropagation
+  after the theory revision of EITHER and FORTE. On a mini-batch, the
+  outputs' errors are passed down layer by layer as targets for the
+  nodes; each node revises its own edges (add an input, remove one, or
+  cover a row at once), and passes what it cannot fix to its inputs as a
+  repair plan -- all inputs, or the cheapest one, or a free node
+  recruited and seeded from an example. The rows already right protect
+  the inputs that decide them (their Boolean derivative). Starts from the
+  empty network by default. Learns parity-4 and the two-bit
+  `parity_groups` exactly, where Pypper and the other deep learners do
+  not; still well behind Pypper on tic-tac-toe and KRK.
+
 ## 0.6.0 (2026-11-08)
 
 Deep Models: `DeepModel`, a rule network in negation normal form, and four

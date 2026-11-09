@@ -1082,6 +1082,22 @@ Next:
   2. A search -- and possibly a start -- driven by examples (e.g. a
      misclassified example picks the moves, rules seeded from examples):
      a different algorithm.
+- `DeepBlameRevision` (experimental, from 2026-11-09, branch
+  `experimental/blame-revision`): the user's direction 2 -- targets for
+  the hidden nodes from the errors, layer-wise, with recruitment of free
+  nodes seeded from examples. What was needed: soft demands for "one
+  input has to hold" (`soft_weight`; else every recruit grew into "always
+  true"), only nodes in use as new inputs (a free AND node is true
+  everywhere), and a child counted as cheap only if its repair breaks no
+  protected row (else an old rule was stretched to examples it does not
+  fit and nothing was recruited). First results (one split, 120 s, empty
+  start, batch 256, soft weight 0.25): `parity_groups` 2-of-4x2 exactly
+  (56 edges; layer 1 holds the eight odd terms, layer 2 mixes groups --
+  not the clean 42-edge decomposition), 2-of-4x3 0.765, parity-4 exact in
+  a second; artificial-nnf-36 0.912 (Pypper 0.946), tic-tac-toe 0.906
+  (0.990), KRK 0.695 (0.830). Open: it stops within seconds in a local
+  optimum (restarts or perturbation); seeds for one-hot data (the most
+  specific seed is mostly negated values); starting from FOIL.
 - **Remove `car-binary` and `connect-4-binary` again** once those
   comparisons are done: they are binary versions of `car` and
   `connect-4`, only there to match the papers' setups (also adjust

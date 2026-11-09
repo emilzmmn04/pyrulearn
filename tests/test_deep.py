@@ -7,7 +7,7 @@ import pytest
 from pyrulearn.data import DataSpec, DataSpecBuilder, HorizontalBitmapRepresentation, SparseDataRepresentation
 from pyrulearn.data.io import build_dataspec, encode
 from pyrulearn.learners.deep import (
-    DeepGenetic, DeepLocalSearch, DeepNeuroFuzzy, DeepSAT, ModelInit, RandomInit, RuleSetInit, contradictions,
+    DeepBlameRevision, DeepGenetic, DeepLocalSearch, DeepNeuroFuzzy, DeepSAT, ModelInit, RandomInit, RuleSetInit, contradictions,
     nnf_forward,
 )
 from pyrulearn.models import ConceptModel, DeepModel
@@ -501,3 +501,69 @@ def test_time_budget_ends_the_search(make):
     m = make().fit(DATA)
     assert time.perf_counter() - start < 10  # the budget, plus one step and the model
     assert m.predict(DATA).shape == (128,)
+
+
+
+# -- DeepBlameRevision -------------------------------------------------------------------
+
+def _boolean_data(label):
+    """All rows of eight Boolean features, `x` and `not x`, labeled by `label(x1, ..., x8)`."""
+    bits = np.array(list(itertools.product([0, 1], repeat=8)), dtype=bool)
+    frame = pd.DataFrame(bits, columns=[f"x{i}" for i in range(1, 9)])
+    frame["class"] = np.where(label(*bits.T), "yes", "no")
+    spec = build_dataspec(frame, target="class").build()
+    return encode(spec, frame, frame["class"].to_numpy())
+
+
+def test_blame_revision_builds_a_dnf_from_the_empty_network():
+    data = _boolean_data(lambda x1, x2, x3, x4, *_: (x1 & x2) | (x3 & ~x4))
+    for layers in ([8], [8, 4, 2]):
+        model = DeepBlameRevision(layers=layers, size_penalty=0.1, target_class="yes").fit(data)
+        assert (model.predict(data) == data.y).all()
+        if layers == [8]:  # the two rules, nothing else
+            assert model.pruned().n_edges == 6
+
+
+def test_blame_revision_learns_parity():
+    # a single condition tells nothing about parity, so greedy covering fails; the
+    # examples seed the rules here
+    data = _boolean_data(lambda x1, x2, x3, x4, *_: x1 ^ x2 ^ x3 ^ x4)
+    model = DeepBlameRevision(layers=[20], size_penalty=1.0, target_class="yes").fit(data)
+    assert (model.predict(data) == data.y).all()
+    assert model.pruned().n_edges == 8 * 4 + 8
+
+
+def test_blame_revision_stays_empty_when_nothing_pays_for_its_edges():
+    data = _boolean_data(lambda x1, x2, x3, x4, *_: x1 & x2 & x3 & x4)  # 16 of 256 rows
+    model = DeepBlameRevision(layers=[8, 4, 2], size_penalty=50.0, target_class="yes").fit(data)
+    assert model.pruned().n_edges == 0
+
+
+def test_blame_revision_is_reproducible_traced_and_bounded():
+    data = _boolean_data(lambda x1, x2, x3, x4, x5, *_: (x1 ^ x2) & (x3 | x5))
+    kw = dict(layers=[16, 4, 2], size_penalty=0.5, batch_size=32, trace=True, random_state=3)
+    m1, m2 = DeepBlameRevision(**kw).fit(data), DeepBlameRevision(**kw).fit(data)
+    assert [w.tolist() for w in m1.weights] == [w.tolist() for w in m2.weights]
+    errors = [p.train_error for p in m1.trace]
+    assert len(errors) >= 2 and m1.trace[0].train_error > m1.trace[-1].train_error
+    assert DeepBlameRevision(max_steps=0, trace=True, **{k: v for k, v in kw.items() if k != "trace"}).fit(
+        data).pruned().n_edges == 0  # no step: the empty start
+    with pytest.raises(ValueError):
+        DeepBlameRevision(soft_weight=0)
+    with pytest.raises(ValueError):
+        DeepBlameRevision(batch_size=0)
+
+
+def test_blame_revision_local_edit_covers_a_row_at_once():
+    learner = DeepBlameRevision()
+    F = np.array([[1, 1, 0, 0],   # input 0
+                  [0, 1, 1, 0],   # input 1
+                  [0, 1, 0, 1]],  # input 2
+                 dtype=bool)
+    # an AND of all three is true on row 1 only; it should also hold on row 0 (where inputs
+    # 1 and 2 are in the way) and not on rows 2, 3: dropping both at once, no single drop helps
+    S = learner._local_edit(np.ones(3, dtype=bool), F, np.array([1, 1, 0, 0]), np.ones(4), True, None, 0.01)
+    assert S.tolist() == [True, False, False]
+    # an OR, by De Morgan: true on rows 0, 1 and not 2, 3 -- input 0 alone
+    S = learner._local_edit(np.zeros(3, dtype=bool), F, np.array([1, 1, 0, 0]), np.ones(4), False, None, 0.01)
+    assert S.tolist() == [True, False, False]

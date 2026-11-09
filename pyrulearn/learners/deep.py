@@ -14,6 +14,10 @@ rules. They differ only in how they find the weights:
   mutation, a few hill-climbing steps per child.
 - `DeepSAT` -- an exact fit by SAT solving, the smallest network by
   MaxSAT (Seip, Fürnkranz et al.).
+- `DeepNeuroFuzzy` -- gradient descent on a fuzzy relaxation, thresholded.
+- `DeepBlameRevision` -- the errors of a mini-batch passed down as targets
+  for the nodes, each revising its edges; free nodes recruited from
+  examples (theory revision on a layered network).
 
 `DeepRuleLearner` is their shared base: the architecture (`layers`), the
 targets (one output node per class; for two classes one output for the
@@ -1516,6 +1520,293 @@ class DeepNeuroFuzzy(DeepRuleLearner):
                 grads[l] = (share * h[:, None, :]).sum(axis=0)
                 g = (share * w[None]).sum(axis=1)
         return grads
+
+
+class DeepBlameRevision(DeepRuleLearner):
+    """Blame revision on mini-batches: the network's errors on a batch are
+    passed down from the outputs as targets for the nodes, layer by layer,
+    and each node revises its own edges to meet them -- a symbolic
+    counterpart of backpropagation, after the theory revision of EITHER
+    and FORTE (Ourston & Mooney; Richards & Mooney), whose blame assignment
+    and clause edits it does on a layered network.
+
+    One step, on a random batch of `batch_size` training rows:
+
+    1. Forward: every node's value on every row.
+    2. Top-down, layer by layer, every node with targets (the outputs:
+       the classes of the batch) first revises its own edges: a greedy
+       search over adding an input, removing one, and *covering a row* --
+       for an AND node, dropping every input that is false on a row it
+       should be true on, at once (an OR node the same, by De Morgan) --
+       judged by its targets met plus `size_penalty` per edge (scaled to
+       the batch).
+    3. The rows it still gets wrong are passed to its inputs as a repair
+       plan: an OR node that should be false needs all its true inputs
+       false, an AND node that should be true all its false inputs true;
+       an OR node that should be true needs *one* input true, an AND node
+       that should be false one input false -- the cheapest, the one with
+       the fewest of its own inputs in the way. Where that costs more than
+       `recruit_threshold` (or there is no input), a free node of the layer
+       below (one the outputs don't depend on) is recruited: connected,
+       and seeded from a row, the inputs true on it for an AND node (false
+       for an OR node) -- the most specific rule for that example, which
+       its own revision then generalizes. The rows a node already gets
+       right protect its inputs (their Boolean derivative): the only true
+       input of an OR node that should stay true keeps its value, all
+       inputs of an OR node that should stay false keep theirs, and the
+       duals for AND. A node's targets are its parents' votes: a demand on
+       all inputs (and a protection) counts 1, the demand on the one
+       chosen input `soft_weight` -- a rule asked to cover rows is judged
+       like a rule in covering, the rows it leaves out cost little (other
+       rules may take them), the negatives it covers a lot.
+    4. The revised network is kept if its training error plus
+       `size_penalty` per edge of the backbone, on all the training data,
+       is no worse; otherwise the step is undone.
+
+    ``batch_size=None`` revises on all the training rows every step.
+    The steps end after `max_steps`, after `patience` steps without a
+    better network, or after `max_seconds`. The default start is the
+    empty network (`init` takes another), which recruitment builds up. In
+    a first AND layer, rules stay consistent with the `DataSpec`'s
+    constraints (`contradictions`) unless ``moves="free"``."""
+
+    def __init__(
+        self,
+        layers: Optional[Sequence[int]] = None,
+        batch_size: Optional[int] = 64,
+        max_steps: Optional[int] = None,
+        patience: int = 200,
+        recruit_threshold: int = 2,
+        soft_weight: float = 0.25,
+        moves: str = "consistent",
+        init: Optional[DeepInit] = None,
+        first: str = "and",
+        target_class: Optional[Any] = None,
+        max_seconds: Optional[float] = None,
+        size_penalty: Optional[float] = None,
+        trace: bool = False,
+        random_state: Optional[int] = 0,
+    ):
+        super().__init__(layers=layers, first=first, init=init, trace=trace, random_state=random_state,
+                         target_class=target_class, size_penalty=size_penalty)
+        if (batch_size is not None and batch_size < 1) or patience < 1 or recruit_threshold < 0:
+            raise ValueError("batch_size and patience must be at least 1, recruit_threshold at least 0")
+        if not 0 < soft_weight <= 1:
+            raise ValueError(f"soft_weight must be in (0, 1], got {soft_weight!r}")
+        if moves not in ("consistent", "free"):
+            raise ValueError(f"moves must be 'consistent' or 'free', got {moves!r}")
+        self.init = init  # None: the empty network
+        self.batch_size = batch_size
+        self.max_steps = max_steps
+        self.patience = patience
+        self.recruit_threshold = recruit_threshold
+        self.soft_weight = soft_weight
+        self.moves = moves
+        self.max_seconds = max_seconds
+
+    def _initialize(self, data, labels, shapes, rng):
+        if self.init is None:
+            return [np.zeros(shape, dtype=bool) for shape in shapes]
+        return self.init.weights(data, labels, shapes, rng, self.first)
+
+    # -- the fit ----------------------------------------------------------------
+
+    def _fit_weights(self, data, labels, X, targets, shapes, start, sample_weight, rng):
+        conflicts = contradictions(data.spec) if self.moves == "consistent" and self.first == "and" else None
+        n = X.shape[0]
+        batch = n if self.batch_size is None else min(self.batch_size, n)
+        # an edge against the batch's rows: lambda scaled from all the rows to the batch
+        lam = (self.size_penalty if self.size_penalty else 1e-6) * batch / n
+        weights = [w.copy() for w in start]
+        error = self._error(weights, X, targets, sample_weight)
+        key = (self._cost(error, weights), self._size(weights))
+        self._offer(weights, error)
+        stale = steps = 0
+        while stale < self.patience and (self.max_steps is None or steps < self.max_steps) and not self._time_up():
+            steps += 1
+            rows = rng.choice(n, batch, replace=False)
+            revised = self._revise(weights, X[rows], targets[:, rows], sample_weight[rows], conflicts, lam, rng)
+            new_error = self._error(revised, X, targets, sample_weight)
+            new_key = (self._cost(new_error, revised), self._size(revised))
+            if new_key <= key:
+                stale = 0 if new_key < key else stale + 1
+                weights, error, key = revised, new_error, new_key
+                self._offer(weights, error)
+            else:
+                stale += 1
+            if error == 0 and self.size_penalty is None:
+                break
+        return weights
+
+    def _revise(self, weights, X, targets, row_weight, conflicts, lam, rng) -> List[np.ndarray]:
+        """One step of blame revision on the batch (X, targets): the
+        revised copy of `weights`."""
+        W = [w.copy() for w in weights]
+        n_layers = len(W)
+        values = nnf_forward(W, X, self.first)
+        inputs = [X.T] + values[:-1]  # what layer l reads, (n_inputs, batch)
+        demand = targets.astype(np.int8)  # the top layer's targets: 1, 0 (-1: none)
+        strength = np.ones(demand.shape)  # how much each target counts
+        for l in range(n_layers - 1, -1, -1):
+            is_and = _is_and(l, self.first)
+            nodes = np.flatnonzero((demand >= 0).any(axis=1))
+            # a node may take a new input among the features, or the nodes in use below it -- a free
+            # node means nothing yet (an empty AND is true everywhere); only recruitment connects one
+            allowed = None if l == 0 else _used_nodes(W)[l - 1]
+            for k in nodes:
+                self._tracker.count(X.shape[0] * W[l].shape[1])
+                W[l][k] = self._local_edit(W[l][k], inputs[l], demand[k], row_weight * strength[k], is_and,
+                                           conflicts if l == 0 else None, lam, allowed)
+            values[l] = _layer(W[l], inputs[l], is_and)
+            if l == 0:
+                break
+            used = _used_nodes(W)[l - 1]
+            up = np.zeros((W[l - 1].shape[0], X.shape[0]))
+            down = np.zeros_like(up)
+            free = list(rng.permutation(np.flatnonzero(~used)))
+            for k in nodes:
+                self._propagate(W, l, k, demand[k], values, inputs, up, down, free, rng)
+            inputs[l] = values[l - 1]
+            demand = np.where(up > down, 1, np.where(down > up, 0, -1)).astype(np.int8)
+            strength = np.abs(up - down)
+        return W
+
+    def _propagate(self, W, l, k, d, values, inputs, up, down, free, rng) -> None:
+        """Node `k` of layer `l` (revised, its targets `d`) votes for the
+        values of its inputs in layer ``l - 1`` (`up`: should be true,
+        `down`: false), recruiting a free node from `free` where its
+        repair would cost more than `recruit_threshold`."""
+        is_and = _is_and(l, self.first)
+        v = values[l][k]
+        child_values = values[l - 1]
+        children = np.flatnonzero(W[l][k])
+        defined = d >= 0
+        ok, bad = defined & (v == d), defined & (v != d)
+        # by De Morgan, an AND node is an OR node of the negated inputs with the negated targets:
+        # `hold` is the value an input has where it holds the node's value up (OR: true, AND: false)
+        hold = not is_and
+        want_up = (d == 1) if not is_and else (d == 0)  # the node needs one input to hold
+        Ch = child_values[children] == hold if len(children) else np.zeros((0, len(d)), dtype=bool)
+        all_votes, one_votes = (up, down) if hold else (down, up)
+        # rows it gets right: an only holding input keeps holding; with none, none may start to
+        single = ok & want_up & (Ch.sum(axis=0) == 1)
+        if single.any():
+            all_votes[children[np.argmax(Ch[:, single], axis=0)], np.flatnonzero(single)] += 1
+        keep_none = ok & ~want_up
+        one_votes[np.ix_(children, np.flatnonzero(keep_none))] += 1
+        # rows it gets wrong where no input may hold: every holding input has to stop
+        stop = bad & ~want_up
+        rows = np.flatnonzero(stop)
+        if len(rows) and len(children):
+            hit = Ch[:, rows]
+            one_votes[children[np.nonzero(hit)[0]], rows[np.nonzero(hit)[1]]] += 1
+        # rows it gets wrong where one input has to hold: the cheapest one, or a recruit
+        need = np.flatnonzero(bad & want_up)
+        if not len(need):
+            return
+        child_is_and = _is_and(l - 1, self.first)
+        G = inputs[l - 1]  # what the children read
+        blocking = G if not child_is_and else ~G  # an input in the way of the child holding
+        if len(children):
+            # a child's repair for a row: drop its inputs in the way there; it counts as cheap if
+            # that is at most `recruit_threshold` inputs and makes it hold on none of the rows where
+            # the node must not hold (an existing rule stretched to an example it does not fit)
+            protected = np.flatnonzero(defined & ~want_up)
+            blocks = blocking.astype(np.int32)
+            cost = np.empty((len(children), len(need)))
+            for i, c in enumerate(children):
+                in_way = W[l - 1][c][:, None] & blocking[:, need]  # (inputs, need rows)
+                n_way = in_way.sum(axis=0)
+                if len(protected):
+                    left = (W[l - 1][c].astype(np.int32) @ blocks[:, protected])[None] \
+                        - in_way.T.astype(np.int32) @ blocks[:, protected]
+                    broken = (left == 0).sum(axis=1)
+                else:
+                    broken = np.zeros(len(need), dtype=int)
+                cost[i] = np.where(broken > 0, np.inf, n_way)
+            cost = cost + rng.random(cost.shape) * 0.5  # ties at random
+            best = np.argmin(cost, axis=0)
+            cheap = cost[best, np.arange(len(need))] <= self.recruit_threshold + 0.5
+        else:
+            best = np.zeros(len(need), dtype=int)
+            cheap = np.zeros(len(need), dtype=bool)
+        soft = self.soft_weight
+        all_votes[children[best[cheap]], need[cheap]] += soft
+        if cheap.all():
+            return
+        if not free:
+            if len(children):
+                all_votes[children[best[~cheap]], need[~cheap]] += soft
+            return
+        c = free.pop()
+        seed = need[~cheap][rng.integers(int((~cheap).sum()))]
+        # the most specific node for the seed row: the inputs holding it there (AND: true, OR: false)
+        W[l - 1][c] = G[:, seed] if child_is_and else ~G[:, seed]
+        W[l][k, c] = True
+        values[l - 1][c] = _layer(W[l - 1][c][None], G, child_is_and)[0]
+        all_votes[c, need[~cheap]] += soft
+        # it must not hold where the node may not: keep it from changing the node's right rows
+        one_votes[c, np.flatnonzero(defined & ~want_up)] += 1
+
+    def _local_edit(self, S, F, d, row_weight, is_and, conflicts, lam, allowed=None) -> np.ndarray:
+        """A node's revised edges: greedy over adding an input (one of
+        `allowed`, default any), removing one and covering a row it should
+        hold on, judged by the weighted targets `d` (1, 0, -1: none) it
+        misses plus `lam` per edge. `S` its edges, `F` its inputs' values
+        ``(n_inputs, batch)``."""
+        if not is_and:  # OR = not AND(not inputs): the same search on the negations
+            return self._local_edit(S, ~F, np.where(d >= 0, 1 - d, -1), row_weight, True, None, lam, allowed)
+        S = S.copy()
+        wP = row_weight * (d == 1)
+        wN = row_weight * (d == 0)
+        nF = (~F).astype(np.int32)
+        for _ in range(4 * F.shape[0] + 4):
+            zf = nF[S].sum(axis=0)  # false inputs per row
+            val = zf == 0
+            size = int(S.sum())
+            loss = wP[~val].sum() + wN[val].sum() + lam * size
+            best_loss, move = loss - 1e-9, None
+            addable = ~S if allowed is None else ~S & allowed
+            add = np.flatnonzero(addable if conflicts is None else addable & ~conflicts[:, S].any(axis=1))
+            if len(add):
+                nv = val[None] & F[add]
+                la = (~nv) @ wP + nv @ wN + lam * (size + 1)
+                i = int(np.argmin(la))
+                if la[i] < best_loss:
+                    best_loss, move = la[i], ("add", add[i])
+            present = np.flatnonzero(S)
+            if len(present):
+                nv = (zf[None] - nF[present]) == 0
+                lr = (~nv) @ wP + nv @ wN + lam * (size - 1)
+                i = int(np.argmin(lr))
+                if lr[i] < best_loss:
+                    best_loss, move = lr[i], ("remove", present[i])
+                uncovered = np.flatnonzero((d == 1) & ~val)
+                if len(uncovered):
+                    blockers = S[:, None] & ~F[:, uncovered]  # (inputs, rows): what is in the way of each
+                    nv = (zf[None] - blockers.T.astype(np.int32) @ nF) == 0
+                    lc = (~nv) @ wP + nv @ wN + lam * (size - blockers.sum(axis=0))
+                    i = int(np.argmin(lc))
+                    if lc[i] < best_loss:
+                        best_loss, move = lc[i], ("cover", blockers[:, i])
+            if move is None:
+                break
+            kind, what = move
+            if kind == "add":
+                S[what] = True
+            elif kind == "remove":
+                S[what] = False
+            else:
+                S &= ~what
+        return S
+
+
+def _used_nodes(weights: Sequence[np.ndarray]) -> List[np.ndarray]:
+    """Per layer, the nodes the outputs depend on."""
+    used = [np.ones(weights[-1].shape[0], dtype=bool)]
+    for w in reversed(weights[1:]):
+        used.insert(0, w[used[0]].any(axis=0))
+    return used
 
 
 class _VariablePool:
