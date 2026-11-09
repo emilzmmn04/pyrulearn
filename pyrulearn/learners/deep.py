@@ -1566,7 +1566,14 @@ class DeepBlameRevision(DeepRuleLearner):
     ``batch_size=None`` revises on all the training rows every step.
     The steps end after `max_steps`, after `patience` steps without a
     better network, or after `max_seconds`. The default start is the
-    empty network (`init` takes another), which recruitment builds up. In
+    empty network (`init` takes another), which recruitment builds up.
+
+    A run ends in a local optimum within seconds, and runs differ (the
+    batches, the tie-breaking, the recruits' seeds): `restarts` more runs
+    from the same start (default 0: one run), ``-1`` as many as fit into
+    `max_seconds` (which it needs); `max_seconds` ends them in any case.
+    The best network of all runs by the objective (then size) is the
+    result, and the trace shows each new best across the runs. In
     a first AND layer, rules stay consistent with the `DataSpec`'s
     constraints (`contradictions`) unless ``moves="free"``."""
 
@@ -1576,6 +1583,7 @@ class DeepBlameRevision(DeepRuleLearner):
         batch_size: Optional[int] = 64,
         max_steps: Optional[int] = None,
         patience: int = 200,
+        restarts: int = 0,
         recruit_threshold: int = 2,
         soft_weight: float = 0.25,
         moves: str = "consistent",
@@ -1595,7 +1603,12 @@ class DeepBlameRevision(DeepRuleLearner):
             raise ValueError(f"soft_weight must be in (0, 1], got {soft_weight!r}")
         if moves not in ("consistent", "free"):
             raise ValueError(f"moves must be 'consistent' or 'free', got {moves!r}")
+        if restarts < -1:
+            raise ValueError(f"restarts must be at least 0, or -1 (until max_seconds), got {restarts!r}")
+        if restarts == -1 and max_seconds is None:
+            raise ValueError("restarts=-1 restarts until max_seconds is up, so it needs max_seconds")
         self.init = init  # None: the empty network
+        self.restarts = restarts
         self.batch_size = batch_size
         self.max_steps = max_steps
         self.patience = patience
@@ -1617,6 +1630,20 @@ class DeepBlameRevision(DeepRuleLearner):
         batch = n if self.batch_size is None else min(self.batch_size, n)
         # an edge against the batch's rows: lambda scaled from all the rows to the batch
         lam = (self.size_penalty if self.size_penalty else 1e-6) * batch / n
+        best, best_key, runs = None, None, 0
+        while True:
+            weights, key = self._run(start, X, targets, sample_weight, conflicts, lam, batch, rng)
+            runs += 1
+            if best is None or key < best_key:
+                best, best_key = weights, key
+            if self._time_up() or (self.restarts != -1 and runs > self.restarts) or (
+                    best_key[0] == 0 and self.size_penalty is None):
+                return best
+
+    def _run(self, start, X, targets, sample_weight, conflicts, lam, batch, rng):
+        """One run of blame revision from `start`: the network it ends with
+        and its (objective, size)."""
+        n = X.shape[0]
         weights = [w.copy() for w in start]
         error = self._error(weights, X, targets, sample_weight)
         key = (self._cost(error, weights), self._size(weights))
@@ -1636,7 +1663,7 @@ class DeepBlameRevision(DeepRuleLearner):
                 stale += 1
             if error == 0 and self.size_penalty is None:
                 break
-        return weights
+        return weights, key
 
     def _revise(self, weights, X, targets, row_weight, conflicts, lam, rng) -> List[np.ndarray]:
         """One step of blame revision on the batch (X, targets): the

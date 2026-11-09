@@ -18,7 +18,9 @@ is in early development (alpha): until 1.0, minor versions may change the API.
   the inputs that decide them (their Boolean derivative). Starts from the
   empty network by default. Learns parity-4 and the two-bit
   `parity_groups` exactly, where Pypper and the other deep learners do
-  not; still well behind Pypper on tic-tac-toe and KRK.
+  not; still well behind Pypper on tic-tac-toe and KRK. `restarts`: more
+  runs from the same start (`-1`: until `max_seconds`), the best by the
+  objective kept -- a run ends in a local optimum within seconds.
 
 ## 0.6.0 (2026-11-08)
 

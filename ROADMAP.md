@@ -1098,6 +1098,14 @@ Next:
   (0.990), KRK 0.695 (0.830). Open: it stops within seconds in a local
   optimum (restarts or perturbation); seeds for one-hot data (the most
   specific seed is mostly negated values); starting from FOIL.
+  Run time (2026-11-09): 6-35 ms per step (`[32, 8, 8]` to `[256, 64,
+  64]`), a run ends by `patience` within 2-15 s; wider or deeper networks
+  do not help (the same optima, sometimes none). Restarts (`restarts`,
+  `-1` until `max_seconds`; 50-120 runs in 300 s) do where runs differ:
+  2-of-4x2 exact with the clean concepts -- for the class "no", the four
+  groups' even parities in layer 2, triples of them in layer 3, 40
+  edges --, tic-tac-toe 0.99 (one run: 0.885); not where all runs end
+  alike (KRK 0.69, 2-of-4x3 0.68).
 - **Remove `car-binary` and `connect-4-binary` again** once those
   comparisons are done: they are binary versions of `car` and
   `connect-4`, only there to match the papers' setups (also adjust

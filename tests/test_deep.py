@@ -1,4 +1,5 @@
 import itertools
+import time
 
 import numpy as np
 import pandas as pd
@@ -495,7 +496,6 @@ def test_size_penalty_trades_errors_for_edges(make, minimal):
     lambda: DeepNeuroFuzzy(layers=[32, 8, 2], epochs=10 ** 6, max_seconds=1.0),
 ])
 def test_time_budget_ends_the_search(make):
-    import time
 
     start = time.perf_counter()
     m = make().fit(DATA)
@@ -567,3 +567,24 @@ def test_blame_revision_local_edit_covers_a_row_at_once():
     # an OR, by De Morgan: true on rows 0, 1 and not 2, 3 -- input 0 alone
     S = learner._local_edit(np.zeros(3, dtype=bool), F, np.array([1, 1, 0, 0]), np.ones(4), False, None, 0.01)
     assert S.tolist() == [True, False, False]
+
+
+def test_blame_revision_restarts_keep_the_best_run():
+    data = _boolean_data(lambda x1, x2, x3, x4, x5, x6, *_: (x1 ^ x2) & (x3 ^ x4) | (x5 & x6))
+    kw = dict(layers=[16, 4, 4], size_penalty=1.0, batch_size=64, target_class="yes", random_state=1)
+
+    def cost(model):
+        return int((model.predict(data) != data.y).sum()) + model.pruned().n_edges
+
+    one = DeepBlameRevision(**kw).fit(data)
+    more = DeepBlameRevision(restarts=4, trace=True, **kw).fit(data)
+    assert cost(more) <= cost(one)  # the first run is the same, the others can only do better
+    assert [p.seconds for p in more.trace] == sorted(p.seconds for p in more.trace)
+    timed = DeepBlameRevision(restarts=-1, max_seconds=1.0, **kw)
+    t = time.perf_counter()
+    timed.fit(data)
+    assert time.perf_counter() - t < 3.0
+    with pytest.raises(ValueError, match="needs max_seconds"):
+        DeepBlameRevision(restarts=-1)
+    with pytest.raises(ValueError):
+        DeepBlameRevision(restarts=-2)
