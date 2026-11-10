@@ -96,7 +96,7 @@ Requires Python ≥ 3.10, `numpy` and `scikit-learn` (the latter because
 |---|---|---|
 | `data` | `pandas`, `scipy` | `pyrulearn.data.io` (reading ARFF/CSV; `scipy` for ARFF and sparse representations) |
 | `plot` | `matplotlib`, `networkx` | coverage-space and refinement-graph plotting in `pyrulearn.evaluation` |
-| `experiments` | `pandas`, `scipy`, `matplotlib` | `pyrulearn.experiments` (the dataset catalog, cross-validation runner, ranking statistics and report helpers behind the comparison scripts in `demos/`) |
+| `experiments` | `pandas`, `scipy`, `matplotlib`, `psutil` | `pyrulearn.experiments` (the dataset catalog, cross-validation runner, ranking statistics and report helpers behind the comparison scripts in `demos/`; `psutil` to stop a timed-out fit's child processes on Linux and macOS) |
 | `wittgenstein` | `wittgenstein` | `pyrulearn.interfaces.wittgenstein` (IREP, RIPPER) |
 | `imodels` | `imodels` | `pyrulearn.interfaces.imodels` (Bayesian rule lists / sets, RuleFit, Slipper) |
 | `pyarc` | `pyarc` | `pyrulearn.interfaces.pyarc` (CBA); `pyarc` itself also needs Borgelt's `pyfim` C extension, no Windows wheels but builds there with MinGW-w64 -- see the module docstring |

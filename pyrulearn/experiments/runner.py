@@ -61,6 +61,9 @@ DEFAULT_FIT_TIMEOUT = 60.0
 #: an older encoding are not reused (0.4.0: numeric attributes in both
 #: directions, few-valued numeric columns ORDINAL)
 ENCODING_VERSION = "0.4.0"
+#: how long `TimeoutRunner` waits for a new worker process to start (a fresh
+#: interpreter importing numpy, scikit-learn and pyrulearn) -- not part of any call's timeout
+DEFAULT_STARTUP_TIMEOUT = 120.0
 
 #: the fixed measures every row carries -- see `run_cv`'s docstring.
 BASE_COLUMNS = ["dataset", "fold", "learner", "fit_time", "error", "accuracy", "n_rules", "n_conditions"]
@@ -74,7 +77,11 @@ def _kill_tree(pid: Optional[int]) -> None:
     only signals the one process; a fitter that spawns its own pool
     (joblib, an external learner's own threading) would otherwise leave
     orphans thrashing the CPU for the rest of the run. Best-effort --
-    never raises."""
+    never raises.
+
+    Must be called while `pid` is still alive: once it is gone, its
+    children are re-parented and can no longer be found from it (and a
+    reaped `pid` may already belong to another process)."""
     if pid is None:
         return
     try:
@@ -83,21 +90,27 @@ def _kill_tree(pid: Optional[int]) -> None:
                            capture_output=True, timeout=15)
         else:
             try:
-                import psutil  # optional; POSIX has no built-in tree-kill
-                proc = psutil.Process(pid)
-                for child in proc.children(recursive=True):
-                    child.kill()
-            except Exception:  # noqa: BLE001
-                pass
+                import psutil  # in the `experiments` extra; POSIX has no built-in tree-kill
+            except ImportError:
+                return
+            proc = psutil.Process(pid)
+            children = proc.children(recursive=True)  # before the kill, see above
+            for p in [proc, *children]:  # the parent first, so it can't start new ones
+                try:
+                    p.kill()
+                except psutil.Error:
+                    pass
     except Exception:  # noqa: BLE001
         pass
 
 
 def _worker_loop(task_q, result_q) -> None:
-    """Runs in a long-lived subprocess started by `TimeoutRunner`: pulls
-    `(fn, args, kwargs)` off `task_q`, calls `fn(*args, **kwargs)`, and
-    pushes `("ok", result)` or `("error", message)` onto `result_q` --
+    """Runs in a long-lived subprocess started by `TimeoutRunner`: first
+    pushes `("ready", None)` onto `result_q` (its imports are done by now),
+    then pulls `(fn, args, kwargs)` off `task_q`, calls `fn(*args, **kwargs)`,
+    and pushes `("ok", result)` or `("error", message)` onto `result_q` --
     forever, until it receives `None` as a stop sentinel."""
+    result_q.put(("ready", None))
     while True:
         item = task_q.get()
         if item is None:
@@ -124,10 +137,17 @@ class TimeoutRunner:
 
     On a timeout the *whole process tree* is killed (`_kill_tree`), not
     just the worker, since some fitters spawn their own children.
+
+    A new worker (the first one, or a replacement) takes a second or more
+    to start; that is not part of any call: `run` starts its clock only
+    once the worker is up (`wait_until_ready`, at most `startup_timeout`
+    seconds).
     """
 
-    def __init__(self, timeout: float = DEFAULT_FIT_TIMEOUT):
+    def __init__(self, timeout: float = DEFAULT_FIT_TIMEOUT,
+                 startup_timeout: float = DEFAULT_STARTUP_TIMEOUT):
         self.timeout = timeout
+        self.startup_timeout = startup_timeout
         self.ctx = mp.get_context("spawn")
         self.task_q = None
         self.result_q = None
@@ -139,16 +159,18 @@ class TimeoutRunner:
         self.result_q = self.ctx.Queue()
         self.proc = self.ctx.Process(target=_worker_loop, args=(self.task_q, self.result_q), daemon=True)
         self.proc.start()
+        self._ready = False
 
     def _kill_worker(self) -> None:
-        pid = self.proc.pid
+        if self.proc.is_alive():
+            # the tree first, while the worker is alive: after it, its children can't be found
+            _kill_tree(self.proc.pid)
         if self.proc.is_alive():
             self.proc.terminate()
             self.proc.join(timeout=5)
             if self.proc.is_alive():
                 self.proc.kill()
                 self.proc.join()
-        _kill_tree(pid)
         # A task the dead worker never read can leave the queue's feeder thread blocked on
         # a full pipe -- and Python joins that thread at exit, so the process would hang.
         # Closing the queues (this process holds the pipe's other end) breaks the pipe,
@@ -157,10 +179,35 @@ class TimeoutRunner:
             q.cancel_join_thread()
             q.close()
 
+    def wait_until_ready(self) -> Optional[str]:
+        """Wait until the worker has started: `None`, or why it didn't (it
+        died, or wasn't up after `startup_timeout` seconds -- it is then
+        replaced by a fresh one). `run` calls this first; a caller timing a
+        `run` from the outside calls it before starting its own clock."""
+        if self._ready:
+            return None
+        deadline = time.monotonic() + self.startup_timeout
+        while True:
+            try:
+                self.result_q.get(timeout=0.1)  # a worker's first message is always ("ready", None)
+            except queue.Empty:
+                if self.proc.is_alive() and time.monotonic() < deadline:
+                    continue
+                code = self.proc.exitcode
+                self._kill_worker()
+                self._start()
+                if code is not None:
+                    return f"worker process failed to start (exit code {code})"
+                return f"worker process not started after {self.startup_timeout:g}s"
+            self._ready = True
+            return None
+
     def run(self, fn: Callable, *args, timeout: Optional[float] = None, **kwargs):
         """Returns `(result, None)` on success, or `(None, error_message)`
         -- for a timeout, `error_message` is exactly ``"timeout"``;
         otherwise it's `fn`'s own exception, stringified. Never raises.
+        The timeout counts from when the worker has started
+        (`wait_until_ready`), so a new worker's start-up is not part of it.
 
         `timeout`, if given, overrides `self.timeout` for this one call
         only -- e.g. a caller that needs a longer budget for one kind of
@@ -168,6 +215,9 @@ class TimeoutRunner:
         share a single worker process rather than running two at once
         (two concurrent `spawn`-context `Process`/`Queue` pairs have been
         observed to corrupt each other's Windows pipe handles)."""
+        error = self.wait_until_ready()
+        if error is not None:
+            return None, error
         self.task_q.put((fn, args, kwargs))
         try:
             status, payload = self.result_q.get(timeout=timeout if timeout is not None else self.timeout)
@@ -302,6 +352,8 @@ def _cache_save(cache_dir: Optional[str], key: str, row: Dict[str, Any]) -> None
 def _measure(learner: RuleLearner, train_rep: DataRepresentation, test_rep: DataRepresentation,
             timeout_runner: Optional[TimeoutRunner],
             measure_fn: Optional[Callable[[Any, DataRepresentation], dict]]) -> Dict[str, Any]:
+    if timeout_runner is not None:
+        timeout_runner.wait_until_ready()  # a new worker's start-up is not part of the fit
     t0 = time.time()
     if timeout_runner is not None:
         model, error = timeout_runner.run(_fit_one, learner, train_rep)
@@ -524,6 +576,7 @@ def _run_cells_parallel(cells, n_jobs: int, fit_timeout: Optional[float],
             if stop_on_timeout and (cell.dataset, cell.learner.display_name) in timed_out:
                 done.put((cell, None, _SKIPPED, np.nan))
                 continue
+            runner.wait_until_ready()  # a new worker's start-up is not part of the fit
             t0 = time.time()
             try:
                 out, error = runner.run(_timed_fit, cell.learner, cell.train_rep)

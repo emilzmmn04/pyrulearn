@@ -3,6 +3,23 @@
 All notable changes to pyrulearn are listed here, newest first. The project
 is in early development (alpha): until 1.0, minor versions may change the API.
 
+## Unreleased
+
+### Fixed
+
+- `TimeoutRunner` (and so `run_cv`) no longer counts a new worker
+  process's start-up (a fresh interpreter importing numpy, scikit-learn
+  and pyrulearn, a second or more) as part of a call: `run` starts the
+  timeout only once the worker is up (`wait_until_ready`, new
+  `startup_timeout=`). Before, the first fit of a run and the first fit
+  after every timeout could time out early, and their `fit_time` (with
+  `n_jobs=1`) included the start-up.
+- A timed-out fit's child processes (a Weka or LORD JVM, a joblib pool)
+  are stopped again: `_kill_tree` ran only after the worker had been
+  killed, when its children could no longer be found from it, so they
+  kept running. It now runs first. `psutil`, which it needs on Linux and
+  macOS, is in the `experiments` and `all` extras.
+
 ## 0.6.0 (2026-11-08)
 
 Deep Models: `DeepModel`, a rule network in negation normal form, and four
