@@ -200,7 +200,7 @@ def test_timeout_runner_records_a_timeout_instead_of_raising():
 
 
 def test_timeout_runner_exits_cleanly_after_killing_a_worker_that_never_read_its_task():
-    """A worker killed before reading its task (here: still starting up) used to leave the
+    """A worker killed before reading its task (here: 8 MB, not read within the timeout) used to leave the
     queue's feeder thread blocked on a full pipe, and Python joins that thread at exit --
     the process hung. Run in a subprocess, so a regression fails the test instead of
     hanging it."""
@@ -215,6 +215,57 @@ def test_timeout_runner_exits_cleanly_after_killing_a_worker_that_never_read_its
     proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=60, env=env)
     assert proc.returncode == 0, proc.stderr
     assert "timeout" in proc.stdout
+
+
+def test_timeout_runner_does_not_count_a_new_workers_start_up():
+    """A new worker takes a second or more to start (a fresh interpreter importing numpy,
+    scikit-learn and pyrulearn). The timeout counts from when it is up, so a fast call on a
+    fresh worker -- the first one, or the replacement after a timeout -- doesn't time out.
+    (`operator.add` and `time.sleep`: unpickling them imports nothing new in the worker.)"""
+    import operator
+    runner = TimeoutRunner(timeout=0.5)
+    try:
+        assert runner.run(operator.add, 1, 2) == (3, None)           # the first worker
+        assert runner.run(time.sleep, 60.0) == (None, "timeout")
+        assert runner.run(operator.add, 1, 2) == (3, None)           # its replacement
+    finally:
+        runner.close()
+
+
+def _start_a_child_then_hang(pid_file: str) -> None:
+    """Module-level (picklable by reference): starts a child process, as a fitter's own
+    pool or an external learner's JVM would, writes its pid to `pid_file`, and hangs."""
+    import subprocess
+    import sys
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+    with open(pid_file, "w") as f:
+        f.write(str(child.pid))
+    time.sleep(120)
+
+
+def test_timeout_runner_stops_the_child_processes_of_a_timed_out_call(tmp_path):
+    psutil = pytest.importorskip("psutil")
+    pid_file = tmp_path / "child.pid"
+    runner = TimeoutRunner(timeout=30.0)
+    try:
+        assert runner.run(_sleep_then_return, 0.0) == ("done", None)  # the worker imports this module
+        assert runner.run(_start_a_child_then_hang, str(pid_file), timeout=3.0) == (None, "timeout")
+    finally:
+        runner.close()
+    try:
+        child = psutil.Process(int(pid_file.read_text()))
+    except psutil.NoSuchProcess:
+        return  # already gone
+    try:
+        gone, _ = psutil.wait_procs([child], timeout=10)
+        assert gone or child.status() == psutil.STATUS_ZOMBIE, "the timed-out call's child is still running"
+    except psutil.NoSuchProcess:
+        pass
+    finally:
+        try:
+            child.kill()  # don't leave it behind if the test failed
+        except psutil.Error:
+            pass
 
 
 def test_run_cv_records_a_failed_fit_without_raising():

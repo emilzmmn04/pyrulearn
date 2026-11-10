@@ -26,7 +26,7 @@ dependencies = [
 [project.optional-dependencies]
 data = ["pandas", "scipy"]                 # pyrulearn.data.io (scipy: ARFF / sparse representations)
 plot = ["matplotlib", "networkx"]          # pyrulearn.evaluation plotting
-experiments = ["pandas", "scipy", "matplotlib"]  # pyrulearn.experiments: run_cv, stats, report (catalog.load needs pandas)
+experiments = ["pandas", "scipy", "matplotlib", "psutil"]  # pyrulearn.experiments: run_cv, stats, report (catalog.load needs pandas; psutil: a timed-out fit's child processes)
 wittgenstein = ["wittgenstein"]            # interfaces.wittgenstein: IREP, RIPPER
 imodels = ["imodels"]                      # interfaces.imodels: Bayesian rule lists / sets
 pyarc = ["pyarc"]                          # interfaces.pyarc: CBA (pyarc itself also needs Borgelt's `pyfim`, a C extension)
@@ -35,7 +35,7 @@ realkd = ["realkd"]                        # interfaces.realkd: optimal rule boo
 sat = ["python-sat"]                       # learners.deep.DeepSAT: SAT/MaxSAT-learned NNF networks
 notebook = ["jupyter", "nbconvert", "ipykernel"]  # regenerating tutorial/tutorial.ipynb/.pdf (PDF export also needs LaTeX + pandoc)
 test = ["pytest"]
-all = ["pandas", "scipy", "matplotlib", "networkx", "wittgenstein", "imodels", "pytest"]
+all = ["pandas", "scipy", "matplotlib", "psutil", "networkx", "wittgenstein", "imodels", "pytest"]
 
 [project.urls]
 Homepage = "https://github.com/juffif/pyrulearn"
